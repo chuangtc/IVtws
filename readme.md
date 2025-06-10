@@ -3,22 +3,34 @@
 - 資料來源 [台灣期貨交易所報價](http://info512.taifex.com.tw/)
 
 ## Requires
-- python 2.7 or 3.x
-- pandas >= 0.18
-- numpy
-- matplotlib
-- selenium and PhantomJS
-- requests
+- python > = 3.10
+- pandas >= 1.3.0
+- numpy>=1.21.0
+- matplotlib>=3.4.0
+- selenium>=4.0.0
+- requests>=2.25.0
 - plotly >= 1.9 (optional)
 - ipywidgets (optional)
 - bqplot (optional)
 - colour (optional)
 
 
+## Quick start example from command line
+
+```cmd
+git clone git@github.com:chuangtc/IVtws.git
+cd IVtws
+python -m venv .venv
+.\.venv\Scripts\activate.bat
+pip install -r requirements.txt
+python main.py
+```
+
+
 ## Quick start example
 
 ```cmd
-git clone https://github.com/Yvictor/IVtws.git
+git clone git@github.com:chuangtc/IVtws.git
 cd IVtws
 jupyter Notebook
 ```

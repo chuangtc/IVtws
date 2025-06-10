@@ -1,6 +1,7 @@
 import os
 import time
 import signal
+import json
 import numpy as np
 import pandas as pd
 from datetime import date,datetime,timedelta
@@ -15,6 +16,17 @@ from plotly.tools import mpl_to_plotly
 from plotly.offline import iplot,iplot_mpl
 import bqplot as bq
 from colour import Color
+
+def _safely_get_table(html_content, selector):
+    """Safely extracts a table from HTML content, returning None if not found."""
+    soup = BS(html_content, "lxml")
+    table_element = soup.select(selector)
+    if not table_element:
+        return None
+    try:
+        return pd.read_html(str(table_element[0]), index_col=0, header=0)[0]
+    except (IndexError, ValueError):
+        return None
 
 def Vol_conversion(input_ele):
     if input_ele == '--':
@@ -65,7 +77,7 @@ def crmt(x):
     current = datetime.today()
     currentdayst = current.replace(hour=8,minute=45,second=0, microsecond=0)
     currentdayend = current.replace(hour=13, minute=45, second=0, microsecond=0)
-    if type(x)!=pd.tslib.NaTType:
+    if not pd.isna(x):
         rmt = (currentdayend-x) /(currentdayend-currentdayst)
         lefttime_today=lefttime_today+rmt
         return lefttime_today
@@ -111,51 +123,141 @@ class IVstream:
         self.opentime = self.timecurr.replace(hour=opet[0], minute=opet[1], second=0, microsecond=0)
         self.closetime = self.timecurr.replace(hour=clost[0], minute=clost[1], second=0, microsecond=0)
         self.options = []
-        self.driver = webdriver.PhantomJS()
-        self.driverf = webdriver.PhantomJS()
+        self.driver = webdriver.Chrome()
         self.Call = []
-        self.future_table = []
+        self.future_table = pd.DataFrame()
         self.cache = None
         self.OptIndx()
     def TWSEquote(self):
         urlfut = 'http://info512.taifex.com.tw/Future/FusaQuote_Norl.aspx?_Category=1'
-        resfut = requests.get(urlfut)
-        resfut.encoding = 'utf-8'
-        soup = BS(resfut.text,"lxml")
-        table = pd.read_html(str(soup.select('#divDG')[0]),index_col=0,header=0)[0]
-        divdata = table.iloc[0:3].transpose().loc[['成交價']].applymap(lambda x : mon_float(x)) #table.iloc[0:3].transpose().loc[['成交價']].astype('float')
-        if divdata['臺指現貨'].values[0]== None:
-            divdata['臺指現貨'] = table.iloc[0].loc['參考價']
+        try:
+            resfut = requests.get(urlfut, timeout=10)
+            resfut.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching future quote: {e}")
+            return None
+
+        table = _safely_get_table(resfut.text, '#divDG')
+        if table is None:
+            print("Could not find future quote table.")
+            return None
+
+        divdata = table.iloc[0:3].transpose().loc[['成交價']].applymap(lambda x : mon_float(x))
+        
+        if '臺指現貨' not in divdata.columns or divdata['臺指現貨'].values[0] is None:
+            if '參考價' in table.iloc[0]:
+                 divdata['臺指現貨'] = table.iloc[0].loc['參考價']
+            else:
+                print("Could not determine spot price.")
+                return None
+        
         return divdata['臺指現貨'].values[0]
     def close_PhantomJS(self):
         self.driver.service.process.send_signal(signal.SIGTERM)
         self.driver.quit()
-        self.driverf.service.process.send_signal(signal.SIGTERM)
-        self.driverf.quit()
     def OptIndx(self):
-        urlexd = 'http://www.taifex.com.tw/chinese/5/OptIndxFSP.asp'
-        resex = requests.get(urlexd)
-        resex.encoding = 'utf-8'
-        exdsoup = BS(resex.text,"lxml")
-        self.weekopexdate = pd.read_html(str(exdsoup.select('.table_c')[0]),header=0)[0][['最後結算日','契約  月份', '臺指選擇權  （TXO）']].set_index('最後結算日')
-        self.weekopexdate.columns = ['契約月份','最後結算價']
-        self.weekopexdate.index = self.weekopexdate.index.to_datetime()
-        self.lastexprice = self.weekopexdate.iloc[0].loc['最後結算價']
+        url = 'https://www.taifex.com.tw/cht/2/getFinalSettlePrice'
+        today = datetime.now()
+        payload = {
+            'queryDate': f'{today.year}/{today.month:02d}',
+            'commodityId': 'TXO'
+        }
+        try:
+            res = requests.post(url, data=payload)
+            res.raise_for_status()
+            data = res.json().get('data', [])
+            if not data:
+                # print("No final settlement price data found for TXO.")
+                self.weekopexdate = pd.DataFrame(columns=['契約月份', '最後結算價'])
+                self.weekopexdate.index.name = '最後結算日'
+                self.lastexprice = None
+                return
+
+            df = pd.DataFrame(data)
+            df = df.rename(columns={
+                'settleDate': '最後結算日',
+                'contractMonth': '契約月份',
+                'finalSettlePrice': '最後結算價'
+            })
+            df = df.set_index('最後結算日')
+            df['最後結算價'] = pd.to_numeric(df['最後結算價'].str.replace(',', ''))
+            
+            self.weekopexdate = df[['契約月份', '最後結算價']]
+            self.weekopexdate.index = pd.to_datetime(self.weekopexdate.index)
+            
+            if not self.weekopexdate.empty:
+                self.lastexprice = self.weekopexdate.iloc[0]['最後結算價']
+            else:
+                self.lastexprice = None
+
+        except (requests.exceptions.RequestException, ValueError, KeyError) as e:
+            # print(f"Error fetching or parsing settlement prices: {e}")
+            self.weekopexdate = pd.DataFrame(columns=['契約月份', '最後結算價'])
+            self.weekopexdate.index.name = '最後結算日'
+            self.lastexprice = None
+
         return self.lastexprice
 
     def futureQuote(self):
-        self.driverf.get('http://info512.taifex.com.tw/Future/FusaQuote_Norl.aspx')
-        time.sleep(0.1)
-        soup = BS(self.driverf.page_source,'lxml')
-        self.future_table = pd.read_html(str(soup.select('#divDG')[0]),header=0)[0]
+        url = "https://mis.taifex.com.tw/futures/api/getQuoteList"
+        # Using standard CIDs for the requested futures:
+        # TXF: TAIEX Futures (臺股期貨)
+        # MTX: Mini-TAIEX Futures (小型臺指期貨)
+        # QMF: Micro-TAIEX Futures (微型臺指期貨)
+        # cids = ['TXF', 'MTX', 'QMF']
+        cids = ['TXF']
+        all_quotes = []
+
+        headers = {
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36'
+        }
+
+        for cid in cids:
+            payload = {
+                "MarketType": "0",
+                "SymbolType": "F",
+                "KindID": "1",
+                "CID": cid,
+                "ExpireMonth": "",
+                "RowSize": "全部",
+                "PageNo": "",
+                "SortColumn": "",
+                "AscDesc": "A",
+            }
+            try:
+                response = requests.post(url, json=payload, headers=headers, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                if data.get('RtCode') == '0':
+                    quotes = data.get('RtData', {}).get('QuoteList', [])
+                    for quote in quotes:
+                        quote['CID'] = cid
+                    all_quotes.extend(quotes)
+            except (requests.exceptions.RequestException, json.JSONDecodeError):
+                # Silently ignore errors for individual CIDs
+                pass
+
+        if all_quotes:
+            self.future_table = pd.DataFrame(all_quotes)
+            # Rename columns to match what get_future expects
+            self.future_table = self.future_table.rename(columns={'CPrice': '成交價', 'CID': '契約'})
+        else:
+            self.future_table = pd.DataFrame()
 
     def get_future(self):
-        if len(self.future_table)==0:
+        if self.future_table.empty:
             self.futureQuote()
-        else:
-            soup = BS(self.driverf.page_source,'lxml')
-            self.future_table = pd.read_html(str(soup.select('#divDG')[0]),header=0)[0]
-        return float(self.future_table['成交價'].iloc[1])
+        
+        if not self.future_table.empty:
+            tx_future = self.future_table[self.future_table['契約'] == 'TXF']
+            if not tx_future.empty and '成交價' in tx_future.columns:
+                price_str = tx_future['成交價'].iloc[0]
+                try:
+                    return float(price_str)
+                except (ValueError, TypeError):
+                    return None
+        return None
 
     def OptQoutedriver(self,exda):
         #self.driver.implicitly_wait(3)
@@ -173,9 +275,22 @@ class IVstream:
         self.driver.save_screenshot('screen.png')
         opt_ps = self.driver.page_source
         soup = BS(opt_ps,"lxml")
-        table = pd.read_html(str(soup.select('#divDG')[0]))[0]
-        Call = table[[0,1,2,3,4,5,6]]
-        Put = table[[6,7,8,9,10,11,12]]
+        tables = pd.read_html(str(soup.select('#divDG')[0]))
+        if not tables:
+            print("No options table found.")
+            self.Call = pd.DataFrame()
+            self.Put = pd.DataFrame()
+            return
+        table = tables[0]
+        
+        if table.shape[1] < 13:
+            print(f"Options table has incorrect column count: {table.shape[1]}")
+            self.Call = pd.DataFrame()
+            self.Put = pd.DataFrame()
+            return
+
+        Call = table.iloc[:, [0,1,2,3,4,5,6]]
+        Put = table.iloc[:, [6,7,8,9,10,11,12]]
         Call.columns = Call.loc[0]
         Call = Call[1:]
         Put.columns = Put.loc[0]
@@ -213,9 +328,22 @@ class IVstream:
             self.OptQoutedriver(exdat)
         opt_ps = self.driver.page_source
         soup = BS(opt_ps,"lxml")
-        table = pd.read_html(str(soup.select('#divDG')[0]))[0]
-        Call = table[[0,1,2,3,4,5,6]]
-        Put = table[[6,7,8,9,10,11,12]]
+        tables = pd.read_html(str(soup.select('#divDG')[0]))
+        if not tables:
+            print("No options stream table found.")
+            self.Call = pd.DataFrame()
+            self.Put = pd.DataFrame()
+            return
+        table = tables[0]
+
+        if table.shape[1] < 13:
+            print(f"Options stream table has incorrect column count: {table.shape[1]}")
+            self.Call = pd.DataFrame()
+            self.Put = pd.DataFrame()
+            return
+            
+        Call = table.iloc[:, [0,1,2,3,4,5,6]]
+        Put = table.iloc[:, [6,7,8,9,10,11,12]]
         Call.columns = Call.loc[0]
         Call = Call[1:]
         Put.columns = Put.loc[0]
