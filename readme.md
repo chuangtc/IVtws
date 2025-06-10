@@ -18,7 +18,7 @@
 ## Quick start example from command line
 
 ```cmd
-git clone git@github.com:chuangtc/IVtws.git
+git clone https://github.com/chuangtc/IVtws.git
 cd IVtws
 python -m venv .venv
 .\.venv\Scripts\activate.bat
@@ -30,7 +30,7 @@ python main.py
 ## Quick start example
 
 ```cmd
-git clone git@github.com:chuangtc/IVtws.git
+git clone https://github.com/chuangtc/IVtws.git
 cd IVtws
 jupyter Notebook
 ```
